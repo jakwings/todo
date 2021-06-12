@@ -1,0 +1,391 @@
+#!/bin/sh
+
+#            DO WHAT THE FUCK YOU WANT TO PUBLIC LICENSE
+#                    Version 2, December 2004
+#
+# Copyright (C) 2021 Jak.W https://github.com/jakwings/todo
+#
+# Everyone is permitted to copy and distribute verbatim or modified
+# copies of this license document, and changing it is allowed as long
+# as the name is changed.
+#
+#            DO WHAT THE FUCK YOU WANT TO PUBLIC LICENSE
+#   TERMS AND CONDITIONS FOR COPYING, DISTRIBUTION AND MODIFICATION
+#
+#  0. You just DO WHAT THE FUCK YOU WANT TO.
+
+# XXX: http://www.in-ulm.de/~mascheck/various/set-e/
+set -e -u -f # -x
+
+LC_ALL=C
+export LC_ALL
+
+TODO_FILE="${HOME}/.config/todo/todo.txt"
+TODO_TEMP="${HOME}/.config/todo/todo.tmp"
+
+help() {
+  echo "I'm a to-do list manager for lazy cats."
+  echo
+  echo "Your data is located at \"${TODO_FILE}\"."
+  printf '%s' '
+Available commands:
+
+    todo       # show your to-do list
+    todo help  # show usage
+
+    todo add [...]     # make a new plan
+    todo done <id>...  # mark a plan done
+    todo undo <id>...  # cancel a plan
+    todo redo <id>...  # revive a plan
+    todo show <id>...  # show full content of a plan
+
+    todo list [todo|done|undo]  # show a more detailed list
+
+    todo history  # show edit history
+    todo cleanup  # focus on current plans and forget everything else
+    todo rawedit  # edit the list with your editor ($VISUAL or $EDITOR)
+'
+}
+echo() {
+  printf '%s\n' "$*"
+}
+pipe() (
+  set -e
+  while IFS= read -r line; do printf '%s\n' "${line}"; done
+)
+todo_echo() {
+  printf '\033[0;1;32m[todo]\033[0m %s\n' "$*"
+}
+todo_ekho() {
+  printf '\033[0;1;31m[todo]\033[0m %s\n' "$*"
+}
+die() {
+  if [ 0 -lt "$#" ]; then
+    todo_ekho "$*" >&2
+  fi
+  exit 1
+}
+
+case_in() {
+  eval "! case \"\$1\" in (${2:-\"\"}) false; esac"
+}
+tsv_read() {
+  # XXX(performance): tsv_read x x x; tsv_read 2 3 4; tsv_read -r x=y
+  IFS= read -r ${1+"$@"} || return 1
+  while [ 1 -lt "$#" ]; do
+    eval "
+      case \"\${$1}\" in
+        (*'	'*)
+          $2=\"\${$1#*	}\"
+          $1=\"\${$1%%	*}\"
+          shift
+          ;;
+        (*) false
+      esac
+    " || break
+  done
+}
+have() {
+  [ -x "$(command -v "$1" 2>/dev/null)" ]
+}
+
+get_editor() {
+  if have "${VISUAL-}"; then
+    echo "${VISUAL}"
+  elif have "${EDITOR-}"; then
+    echo "${EDITOR}"
+  elif have nano; then
+    echo nano
+  elif have vim; then
+    echo vim
+  elif have vi; then
+    echo vi
+  else
+    return 1
+  fi
+}
+edit() (
+  set -e
+  file="$1"
+  editor="$(get_editor)" || die 'no available editor'
+  "${editor}" "${file}"
+)
+wipe() {
+  if have rm; then
+    rm -- "$1"
+  else
+    [ -f "$1" ] || die "wipe(): file \"$1\" not found"
+    printf '' > "$1"
+  fi
+}
+
+EOL='
+'
+TAB='	'
+
+check_id() {
+  ! case_in "$1" '0*|*[!0-9]*'
+}
+
+# remove whitespace, number sign and leading zeros
+reformat_id() {
+  echo "$(( ${1#"${1%%[1-9]*}"} + 0 ))"
+}
+
+new_id() (
+  set -e
+  id=0
+  while tsv_read num rest; do
+    check_id "${num}" || die 'to-do list corrupted'
+    if [ "${id}" -lt "${num}" ]; then
+      id="${num}"
+    fi
+  done
+  echo "$(( id + 1 ))"
+)
+
+get_item_by_id() (
+  set -e
+  lineno=0 items=''
+  for id; do
+    [ 0 -lt "${id}" ] || die 'get_item_by_id(): invalid id'
+    : $(( found_$id = 0 ))
+  done
+  while tsv_read num rest; do
+    check_id "${num}" || die 'to-do list corrupted'
+    for id; do
+      if [ "${id}" -eq "${num}" ]; then
+        : $(( lineno += 1 ))
+        : $(( found_$id = found_$num = lineno ))
+        items="${items}${items:+"${EOL}"}${num}${TAB}${rest}"
+        break
+      fi
+    done
+  done
+  [ 0 -lt "${#items}" ] || die 'no to-do item found'
+  lineno=0
+  while tsv_read num rest; do
+    : $(( lineno += 1 ))
+    if [ "${lineno}" -eq "$(( found_$num ))" ]; then
+      echo "${num}${TAB}${rest}"
+    fi
+  done <<EOT
+${items}
+EOT
+)
+
+merge_items() (
+  set -e
+  lineno=0 items=''
+  while tsv_read num rest; do
+    check_id "${num}" || die 'to-do list corrupted'
+    : $(( lineno += 1 ))
+    : $(( found_$num = lineno ))
+    items="${items}${items:+"${EOL}"}${num}${TAB}${rest}"
+  done
+  lineno=0
+  while tsv_read num rest; do
+    : $(( lineno += 1 ))
+    if [ "${lineno}" -eq "$(( found_$num ))" ]; then
+      echo "${num}${TAB}${rest}"
+    fi
+  done <<EOT
+${items}
+EOT
+)
+
+cleanup() {
+  if [ -e "${TODO_TEMP}" ]; then
+    wipe "${TODO_TEMP}"
+  fi
+}
+trap cleanup EXIT
+
+# todo() {
+if ! [ -f "${TODO_FILE}" ]; then
+  { mkdir -p "${TODO_FILE%/*}" && printf '' > "${TODO_FILE}"; } \
+    || die 'failed to initialized to-do list'
+fi
+
+if [ 0 -ge "$#" ]; then
+  set -- list todo
+fi
+action="$1"
+shift
+case "${action}" in
+  (list)
+    category="${1-}"
+    case "${category}" in
+      (todo) category=TODO ;;
+      (done) category=DONE ;;
+      (undo) category=UNDO ;;
+      (?*) die "unknown category \"${action}\"" ;;
+    esac
+    items="$(merge_items < "${TODO_FILE}")"
+    while tsv_read id mark text more; do
+      if [ '' = "${category}" ]; then
+        printf '[%04d %s] %s\n' "${id}" "${mark}" "${text}${more:+ (...)}"
+      else
+        if [ x"${mark}" = x"${category}" ]; then
+          printf '[%04d] %s\n' "${id}" "${text}${more:+ (...)}"
+        fi
+      fi
+    done <<EOT
+${items}
+EOT
+    ;;
+
+  (help)
+    help
+    ;;
+
+  (add)
+    text='' editor=''
+    if [ 0 -lt "$#" ]; then
+      text="$*"
+    else
+      if [ -t 0 ] && editor="$(get_editor)"; then
+        "${editor}" "${TODO_TEMP}"
+        text="$(pipe < "${TODO_TEMP}")"
+      else
+        todo_echo 'describe your plan below (press Ctrl-D to end)' >&2
+        text="$(pipe)"
+      fi
+    fi
+    text="$(
+      set -e
+      while IFS= read -r line; do
+        more=''
+        while case_in "${line}" '*"${TAB}"*'; do
+          more="${more}${line%%"${TAB}"*}        "
+          line="${line#*"${TAB}"}"
+        done
+        printf '\t%s' "${more}${line}"
+      done <<EOT
+${text}
+EOT
+    )"
+    mark=TODO
+    id="$(new_id < "${TODO_FILE}")"
+    echo "${id}${TAB}${mark}${text}" >> "${TODO_FILE}"
+    todo_echo "added one to-do item (id=${id})" >&2
+    ;;
+
+  (done|undo|redo)
+    [ 1 -le "$#" ] || die 'missing id for to-do item'
+    case "${action}" in
+      (done) new_mark=DONE ;;
+      (undo) new_mark=UNDO ;;
+      (redo) new_mark=TODO ;;
+      (*) die 'internal error'
+    esac
+    for id; do
+      [ 0 -lt "${id}" ] || die "invalid id for to-do items: ${id}"
+    done
+    ids="$(for id; do reformat_id "${id}"; done)"
+    set -- $ids
+    for id; do
+      : $(( found_$id = 0 ))
+    done
+    items="$(get_item_by_id "$@" < "${TODO_FILE}")"
+    while tsv_read id mark text more; do
+      new_item="${id}${TAB}${new_mark}${TAB}${text}${more:+"${TAB}${more}"}"
+      echo "${new_item}" >> "${TODO_FILE}"
+      todo_echo "updated one to-do item (id=${id})" >&2
+      printf '[%04d %s] %s\n' "${id}" "${new_mark}" "${text}${more:+ (...)}" >&2
+      : $(( found_$id = 1 ))
+    done <<EOT
+${items}
+EOT
+    for id; do
+      if [ 0 -eq "$(( found_$id ))" ]; then
+        todo_ekho "no to-do item associated with id \"${id}\"" >&2
+        : $(( found_$id = 1 ))  # dedup
+      fi
+    done
+    ;;
+
+  (show)
+    [ 1 -le "$#" ] || die 'missing id for to-do item'
+    for id; do
+      [ 0 -lt "${id}" ] || die "invalid id for to-do items: ${id}"
+    done
+    ids="$(for id; do reformat_id "${id}"; done)"
+    set -- $ids
+    for id; do
+      : $(( found_$id = 0 ))
+    done
+    items="$(get_item_by_id "$@" < "${TODO_FILE}")"
+    while tsv_read id mark text; do
+      more=''
+      while case_in "${text}" '*"${TAB}"*'; do
+        more="${more}${text%%"${TAB}"*}${EOL}"
+        text="${text#*"${TAB}"}"
+      done
+      printf '[%04d %s] %s\n\n' "${id}" "${mark}" "${more}${text}"
+      : $(( found_$id = 1 ))
+    done <<EOT
+${items}
+EOT
+    for id; do
+      if [ 0 -eq "$(( found_$id ))" ]; then
+        todo_ekho "no to-do item associated with id \"${id}\"" >&2
+        : $(( found_$id = 1 ))  # dedup
+      fi
+    done
+    ;;
+
+  (history)
+    while tsv_read id mark text more; do
+      printf '[%04d %s] %s\n' "${id}" "${mark}" "${text}${more:+ (...)}"
+    done < "${TODO_FILE}"
+    ;;
+
+  (cleanup)
+    items="$(merge_items < "${TODO_FILE}")"
+    new_id=0
+    while tsv_read id mark text; do
+      if [ TODO = "${mark}" ]; then
+        : $(( new_id += 1 ))
+        echo "${new_id}${TAB}${mark}${TAB}${text}"
+      fi
+    done > "${TODO_TEMP}" <<EOT
+${items}
+EOT
+    pipe < "${TODO_TEMP}" > "${TODO_FILE}"
+    todo_echo 'successfully rebuilt the to-do list' >&2
+    ;;
+
+  (rawedit)
+    pipe < "${TODO_FILE}" > "${TODO_TEMP}"
+    edit "${TODO_TEMP}"
+    lineno=0 count=0 s=''
+    while tsv_read id mark text; do
+      : $(( lineno += 1 ))
+      if ! check_id "${id}" || ! case_in "${mark}" 'TODO|UNDO|DONE'; then
+        : $(( count += 1 ))
+        todo_ekho "found corrupted item on line#${lineno}:"
+        echo "${id}${TAB}${mark}${TAB}${text}"
+      fi
+    done < "${TODO_TEMP}" >&2
+    if [ 0 -eq "${count}" ]; then
+      pipe < "${TODO_TEMP}" > "${TODO_FILE}"
+      todo_echo 'successfully rebuilt the to-do list'
+    else
+      if [ 1 -lt "${count}" ]; then s=s; fi
+      todo_ekho "${count} invalid item${s} found"
+      todo_ekho "corrupt data saved in \"${TODO_TEMP}\""
+      TODO_TEMP=''
+      die
+    fi >&2
+    ;;
+
+  (*)
+    {
+      todo_ekho "unknown action \"${action}\""
+      echo
+      help
+    } >&2
+    die
+esac
+# }
